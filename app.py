@@ -103,6 +103,7 @@ def validate_propose_envelope(body):
         "receiptVerifier",
         "corpus",
         "dossiers",
+        "allowedActions",
     }
 
     received = set(body.keys())
