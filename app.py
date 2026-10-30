@@ -57,7 +57,8 @@ async def endpoint(request: Request):
             return await commit(body)
         return json_error(400, "unsupported operation")
     except ValueError as e:
-        return json_error(422, str(e))
+    print(f"VALIDATION ERROR: {str(e)}", flush=True)
+    return json_error(422, str(e))
     except Exception:
         return json_error(500, "internal processing error")
 
