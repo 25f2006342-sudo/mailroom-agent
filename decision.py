@@ -72,10 +72,10 @@ def _chunks(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]
 def _is_transient_error(exc: Exception) -> bool:
     message = str(exc).lower()
     markers = (
-        "http 429", "http 500", "http 502", "http 503", "http 504",
+        "429", "500", "502", "503", "504",
         "deadline expired", "timed out", "timeout", "temporarily unavailable",
-        "service unavailable", "connection reset", "connection error",
-        "internal error", "resource exhausted",
+        "service unavailable", "unavailable", "connection reset", "connection error",
+        "readerror", "resource exhausted",
     )
     return any(marker in message for marker in markers)
 
@@ -162,7 +162,7 @@ async def _generate_chunk(
                         f"Gemini batch {batch_number} failed{status_text}: {exc}"
                     ) from exc
 
-                delay = 1.0 * (2 ** attempt)
+                delay = 2.0 * (2 ** attempt)
                 logger.warning(
                     "GEMINI BATCH RETRY batch=%s attempt=%s delay_seconds=%.1f error=%s",
                     batch_number, attempt + 1, delay, exc,
@@ -184,9 +184,10 @@ async def decide_batch(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "90000"))
     max_output_tokens = int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "12000"))
-    batch_size = max(1, int(os.getenv("GEMINI_BATCH_SIZE", "4")))
-    concurrency = max(1, int(os.getenv("GEMINI_CONCURRENCY", "4")))
-    retries = max(0, int(os.getenv("GEMINI_RETRIES", "1")))
+    # Conservative defaults for the Gemini free tier: avoid burst concurrency.
+    batch_size = max(1, int(os.getenv("GEMINI_BATCH_SIZE", "8")))
+    concurrency = max(1, int(os.getenv("GEMINI_CONCURRENCY", "1")))
+    retries = max(0, int(os.getenv("GEMINI_RETRIES", "3")))
 
     batches = _chunks(dossiers, batch_size)
     semaphore = asyncio.Semaphore(concurrency)
@@ -203,6 +204,9 @@ async def decide_batch(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
     async with client.aio as async_client:
+        # return_exceptions=True ensures every task finishes before the client
+        # context closes. A single failed batch must not close the client while
+        # sibling requests are still using it.
         results = await asyncio.gather(
             *[
                 _generate_chunk(
@@ -215,8 +219,14 @@ async def decide_batch(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     semaphore=semaphore,
                 )
                 for index, batch in enumerate(batches)
-            ]
+            ],
+            return_exceptions=True,
         )
+
+    failures = [item for item in results if isinstance(item, BaseException)]
+    if failures:
+        first = failures[0]
+        raise RuntimeError(f"Gemini proposal generation failed after batch retries: {first}") from first
 
     proposals: list[dict[str, Any]] = []
     for batch_result in results:
