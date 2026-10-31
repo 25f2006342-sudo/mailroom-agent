@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Any
 
 from google import genai
@@ -97,6 +98,8 @@ async def _generate_chunk(
     )
 
     async with semaphore:
+        started = time.perf_counter()
+        print(f"GEMINI BATCH START: count={len(dossiers)}", flush=True)
         for attempt in range(retries + 1):
             try:
                 response = await client.models.generate_content(
@@ -121,13 +124,17 @@ async def _generate_chunk(
                     raise RuntimeError("Gemini response must be a JSON object containing a proposals list")
 
                 proposals = parsed["proposals"]
-                if len(proposals) != len(dossiers):
+                print(f"GEMINI PROPOSE COMPLETE: proposals={len(proposals)} seconds={time.perf_counter() - total_started:.1f}", flush=True)
+        if len(proposals) != len(dossiers):
                     raise RuntimeError(
                         f"Gemini returned {len(proposals)} proposals for {len(dossiers)} dossiers"
                     )
+                elapsed = time.perf_counter() - started
+                print(f"GEMINI BATCH OK: count={len(dossiers)} seconds={elapsed:.1f}", flush=True)
                 return proposals
 
             except Exception as exc:
+                print(f"GEMINI BATCH ERROR: count={len(dossiers)} attempt={attempt + 1} error={exc}", flush=True)
                 if attempt >= retries or not _is_transient_error(exc):
                     status = _http_status(exc)
                     status_text = f" (HTTP {status})" if status else ""
@@ -151,11 +158,13 @@ async def decide_batch(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "90000"))
     # This is a per-chunk cap. Keep the existing Render variable compatible.
     max_output_tokens = int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "12000"))
-    chunk_size = max(1, int(os.getenv("GEMINI_BATCH_SIZE", "8")))
-    concurrency = max(1, int(os.getenv("GEMINI_CONCURRENCY", "2")))
-    retries = max(0, int(os.getenv("GEMINI_RETRIES", "2")))
+    chunk_size = max(1, int(os.getenv("GEMINI_BATCH_SIZE", "4")))
+    concurrency = max(1, int(os.getenv("GEMINI_CONCURRENCY", "4")))
+    retries = max(0, int(os.getenv("GEMINI_RETRIES", "1")))
 
     batches = _chunks(dossiers, chunk_size)
+    print(f"GEMINI PROPOSE START: dossiers={len(dossiers)} batches={len(batches)} batch_size={chunk_size} concurrency={concurrency}", flush=True)
+    total_started = time.perf_counter()
     semaphore = asyncio.Semaphore(concurrency)
 
     http_options = types.HttpOptions(timeout=timeout_ms)
@@ -181,6 +190,7 @@ async def decide_batch(dossiers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for result in chunk_results:
             proposals.extend(result)
 
+        print(f"GEMINI PROPOSE COMPLETE: proposals={len(proposals)} seconds={time.perf_counter() - total_started:.1f}", flush=True)
         if len(proposals) != len(dossiers):
             raise RuntimeError(
                 f"Internal count mismatch: {len(proposals)} proposals for {len(dossiers)} dossiers"
