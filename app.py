@@ -13,6 +13,7 @@ from policy import validate_proposal, verify_receipt_signature, normalized_propo
 
 PROFILE = "ga5-mailroom-action-gate/v2"
 MAX_BODY = int(os.getenv("MAX_BODY_BYTES", "2097152"))
+MAX_RESPONSE = 512 * 1024
 DB_PATH = os.getenv("DATABASE_PATH", "/tmp/mailroom.sqlite3")
 CALL_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 EXPECTED_ACTIONS = [
@@ -46,6 +47,10 @@ async def limit_body(request: Request, call_next):
         request.state.raw_body = raw
     response = await call_next(request)
     response.headers["Content-Type"] = "application/json"
+    if request.method == "POST" and response.status_code < 300:
+        body = getattr(response, "body", b"")
+        if len(body) > MAX_RESPONSE:
+            return json_error(500, "successful response exceeds 512 KiB")
     return response
 
 
@@ -161,12 +166,17 @@ async def propose(body):
     if missing:
         generated = await decide_batch([d for d, _ in missing])
         if len(generated) != len(missing): raise ValueError("model returned incorrect proposal count")
+        pending_cache = []
         for (dossier, fp), proposal in zip(missing, generated):
             validate_proposal(dossier, proposal, ALLOWED)
+            proposal = dict(proposal)
             proposal["callId"] = stable_call_id(dossier["dossierId"], fp)
             validate_proposal(dossier, proposal, ALLOWED)
-            store.put_decision(dossier["dossierId"], fp, proposal)
+            pending_cache.append((dossier, fp, proposal))
             proposals_by_id[dossier["dossierId"]] = proposal
+        # Cache only after every generated proposal passed schema/evidence validation.
+        for dossier, fp, proposal in pending_cache:
+            store.put_decision(dossier["dossierId"], fp, proposal)
 
     proposals = []
     for dossier in body["dossiers"]:

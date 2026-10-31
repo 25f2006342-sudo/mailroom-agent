@@ -79,66 +79,75 @@ def _chunks(items, size):
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 async def decide_batch(dossiers):
-    """Return exactly one proposal per dossier, preserving input order."""
+    """Return exactly one proposal per dossier, preserving input order.
+
+    Retries only transient provider failures. Output/schema failures fail closed.
+    """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    timeout_ms = int(os.getenv("GEMINI_TIMEOUT_MS", "25000"))
-    chunk_size = int(os.getenv("GEMINI_BATCH_SIZE", "16"))
-    concurrency = int(os.getenv("GEMINI_CONCURRENCY", "4"))
-    max_output_tokens = int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "6000"))
+    timeout_ms = max(1000, int(os.getenv("GEMINI_TIMEOUT_MS", "25000")))
+    chunk_size = max(1, min(32, int(os.getenv("GEMINI_BATCH_SIZE", "16"))))
+    concurrency = max(1, min(4, int(os.getenv("GEMINI_CONCURRENCY", "2"))))
+    retries = max(0, min(3, int(os.getenv("GEMINI_RETRIES", "2"))))
+    max_output_tokens = max(1024, min(8192, int(os.getenv("MODEL_MAX_OUTPUT_TOKENS", "6000"))))
 
     batches = _chunks(dossiers, chunk_size)
     semaphore = asyncio.Semaphore(concurrency)
-    base_client = genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=timeout_ms),
-    )
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
 
-    async def run_one(client, index, batch):
+    def transient(exc):
+        status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        message = str(exc).lower()
+        return status in (408, 429, 500, 502, 503, 504) or any(
+            marker in message for marker in ("503", "unavailable", "resource exhausted", "429", "rate limit", "timed out", "timeout", "500", "502", "504")
+        )
+
+    async def run_one(index, batch):
         prompt = (
             "Classify every dossier in this batch. Return exactly one proposal "
             "per dossier, in the same order. Do not omit any dossier.\n\n"
             + json.dumps({"dossiers": batch}, ensure_ascii=False, separators=(",", ":"))
         )
         async with semaphore:
-            print(f"DECISION BATCH {index + 1}/{len(batches)} START ({len(batch)} dossiers)", flush=True)
-            response = await client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM,
-                    temperature=0,
-                    response_mime_type="application/json",
-                    max_output_tokens=max_output_tokens,
-                ),
-            )
-        content = getattr(response, "text", None)
-        if not content or not content.strip():
-            raise ValueError(f"Gemini returned empty output for batch {index + 1}")
-        parsed = json.loads(content)
-        proposals = parsed.get("proposals") if isinstance(parsed, dict) else None
-        if not isinstance(proposals, list) or len(proposals) != len(batch):
-            raise ValueError(
-                f"Batch {index + 1}: expected {len(batch)} proposals, "
-                f"received {len(proposals) if isinstance(proposals, list) else 'invalid'}"
-            )
-        print(f"DECISION BATCH {index + 1}/{len(batches)} OK", flush=True)
-        return proposals
+            for attempt in range(retries + 1):
+                try:
+                    print(f"DECISION BATCH {index + 1}/{len(batches)} ATTEMPT {attempt + 1}", flush=True)
+                    response = await client.aio.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM,
+                            temperature=0,
+                            response_mime_type="application/json",
+                            max_output_tokens=max_output_tokens,
+                        ),
+                    )
+                    content = getattr(response, "text", None)
+                    if not content or not content.strip():
+                        raise ValueError(f"Gemini returned empty output for batch {index + 1}")
+                    parsed = json.loads(content)
+                    proposals = parsed.get("proposals") if isinstance(parsed, dict) else None
+                    if not isinstance(proposals, list) or len(proposals) != len(batch):
+                        raise ValueError(f"Batch {index + 1}: expected {len(batch)} proposals")
+                    print(f"DECISION BATCH {index + 1}/{len(batches)} OK", flush=True)
+                    return proposals
+                except Exception as exc:
+                    if attempt >= retries or not transient(exc):
+                        raise
+                    delay = min(2 ** attempt, 4)
+                    print(f"DECISION BATCH {index + 1} transient failure; retrying in {delay}s: {type(exc).__name__}", flush=True)
+                    await asyncio.sleep(delay)
 
     try:
-        async with base_client.aio as client:
-            results = await asyncio.gather(
-                *(run_one(client, i, batch) for i, batch in enumerate(batches)),
-                return_exceptions=True,
-            )
+        results = await asyncio.gather(
+            *(run_one(i, batch) for i, batch in enumerate(batches)),
+            return_exceptions=True,
+        )
     finally:
-        try:
-            base_client.close()
-        except Exception:
-            pass
+        client.close()
 
     errors = [r for r in results if isinstance(r, BaseException)]
     if errors:
